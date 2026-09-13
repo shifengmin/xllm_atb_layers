@@ -31,7 +31,9 @@
 #include "operations/aclnn/ops/cast_operation.h"
 #include "operations/aclnn/ops/concat_operation.h"
 #include "operations/aclnn/ops/moe_fused_add_topk.h"
+#include "operations/aclnn/ops/moe_gating_top_k.h"
 #include "operations/aclnn/ops/moe_fused_reducesum_div_operation.h"
+#include "operations/fusion/moe/moe_gating_topk_select.h"
 #include "atb_speed/base/event_manager.h"
 
 DECLARE_bool(enable_atb_comm_multiprocess);
@@ -49,6 +51,12 @@ static const uint64_t NUM5 = 5;
 constexpr uint32_t TOPK_IN_NUM = 4;
 constexpr uint32_t TOPK_IN3_DIM = 3;
 constexpr const char* FUSED_ADD_TOPK_ADDNUM_FP32 = "intermediate_router_bias_fp32";
+
+bool UseMoeGatingTopK(const SparseMoeParam &param)
+{
+    return UseMoeGatingTopK(param.enableFusedTopk, param.routingMethod,
+        param.numOfGroups, static_cast<int32_t>(param.numOfExperts));
+}
 constexpr const char* MEGA_MOE_EXPERT_TOKEN_NUMS = "intermediate_mega_moe_expert_token_nums";
 
 bool SkipRouterWeightCast(const SparseMoeParam &param)
@@ -260,6 +268,9 @@ std::map<std::string, uint32_t> ConstructTensorMap(
     if (param.forceMoeFusedAddTopkAddNumFp32) {
         interTensorList.push_back(FUSED_ADD_TOPK_ADDNUM_FP32);
     }
+    if (UseMoeGatingTopK(param)) {
+        interTensorList.push_back("intermediate_moe_gating_topk_out");
+    }
     if (param.enableMegaMoe) {
         AddTensorToList(moeMlpInTensorCandidates, "mega_moe", inTensorList);
         interTensorList.push_back(MEGA_MOE_EXPERT_TOKEN_NUMS);
@@ -419,9 +430,50 @@ atb::Status CreateConcat(std::map<std::string, uint32_t> &tensorMap, const Spars
     return atb::NO_ERROR;
 }
 
+atb::Status CreateMoeGatingTopK(std::map<std::string, uint32_t> &tensorMap,
+    const SparseMoeParam &param, atb::GraphParam &opGraph)
+{
+    if (param.num.empty() || param.topkGroups.empty()) {
+        ATB_SPEED_LOG_ERROR("MoeGatingTopK requires num and topkGroups");
+        return atb::ERROR_INVALID_GRAPH;
+    }
+    atb::Node gatingTopkNode;
+    atb_speed::common::AclNNMoeGatingTopKParam gatingParam;
+    gatingParam.k = param.num[0];
+    gatingParam.kGroup = param.topkGroups[0];
+    gatingParam.groupCount = param.numOfGroups > 0 ? param.numOfGroups : 1;
+    gatingParam.groupSelectMode = MOE_GATING_TOPK_GROUP_SELECT_MODE;
+    gatingParam.renorm = MOE_GATING_TOPK_RENORM;
+    gatingParam.normType = MOE_GATING_TOPK_NORM_TYPE;
+    gatingParam.outFlag = false;
+    gatingParam.routedScalingFactor = param.routedScalingFactor;
+    gatingParam.eps = MOE_GATING_TOPK_EPS;
+    gatingTopkNode.operation = new atb_speed::common::MoeGatingTopKOperation(
+        "MoeGatingTopKOperationFp32", gatingParam);
+    // Loader keeps e_score_correction_bias in FP32. Gate GEMM already emits
+    // FP32 logits when enableTopkFp32; skip identity Casts on the hot path.
+    gatingTopkNode.inTensorIds = {
+        GetTensorIdx(tensorMap, (param.enableGatingShift) ?
+            "intermediate_router_logits_shifted" : "intermediate_router_logits"),
+        GetTensorIdx(tensorMap, "in_gate_bias")};
+    gatingTopkNode.outTensorIds = {
+        GetTensorIdx(tensorMap, "intermediate_router_weights_topk_reduced_fp32"),
+        GetTensorIdx(tensorMap, "intermediate_selected_experts"),
+        GetTensorIdx(tensorMap, "intermediate_moe_gating_topk_out")};
+    if (param.enableGatingOverlap) {
+        atb::SetExecuteStreamId(gatingTopkNode.operation, STREAM1);
+    }
+    opGraph.nodes.push_back(gatingTopkNode);
+    ATB_SPEED_LOG_DEBUG("MoeGatingTopKOperation calculation success");
+    return atb::NO_ERROR;
+}
+
 atb::Status CreateFusedAddTopk(std::map<std::string, uint32_t> &tensorMap,
     const SparseMoeParam &param, atb::GraphParam &opGraph)
 {
+    if (UseMoeGatingTopK(param)) {
+        return CreateMoeGatingTopK(tensorMap, param, opGraph);
+    }
     atb::Node fusedAddTopkNode;
 
     atb_speed::common::AclNNMoeFusedAddTopkParam fusedAddTopkParam;
@@ -438,7 +490,6 @@ atb::Status CreateFusedAddTopk(std::map<std::string, uint32_t> &tensorMap,
     fusedAddTopkParam.scale = param.routedScalingFactor;
 
     fusedAddTopkNode.operation = new atb_speed::common::MoeFusedAddTopkOperation("MoeFusedAddTopkOperation", fusedAddTopkParam);
-    // CHECK_OPERATION_STATUS_RETURN(CreateOperation(fusedAddTopkDivParam, &fusedAddTopkNode.operation));
     fusedAddTopkNode.inTensorIds = {GetTensorIdx(tensorMap, (param.enableGatingShift) ? \
                                        "intermediate_router_logits_shifted" : "intermediate_router_logits"),
                                        GetTensorIdx(tensorMap, param.forceMoeFusedAddTopkAddNumFp32 ? \

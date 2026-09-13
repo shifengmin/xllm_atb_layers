@@ -1125,13 +1125,17 @@ atb::Status SetSparseMoeParam(atb_speed::common::SparseMoeParam &sparseMoeParam,
     sparseMoeParam.enableInitQuant = param.enableInitQuant;
     sparseMoeParam.enableSwigluQuant = param.enableSwigluQuant;
     sparseMoeParam.enableFusedTopk = param.enableFusedTopk;
+    // n_group=1 (GLM-5.x) cannot use 32-wide fused AddTopk; SparseMoe will
+    // switch to aclnnMoeGatingTopK when enableFusedTopk is set.
+    if (sparseMoeParam.routingMethod == "noAuxTc" &&
+        sparseMoeParam.numOfGroups <= 1) {
+        sparseMoeParam.enableFusedTopk = true;
+    }
     sparseMoeParam.enableTopkFp32 = (param.index_n_heads > 0);
     const bool fp32GateInput = isGatherPreNorm(param) && param.isDynamicEp;
-    // Ascend aclnn MoeFusedAddTopk requires addNum dtype to match x dtype.
-    // Cast addNum to FP32 only when fused topk consumes FP32 router logits.
-    sparseMoeParam.forceMoeFusedAddTopkAddNumFp32 =
-        sparseMoeParam.enableFusedTopk && param.enableATBGateMatmul &&
-        sparseMoeParam.enableTopkFp32;
+    // Do not insert a hot-path Cast on gate bias. GLM GatingTopK keeps
+    // checkpoint FP32 in the loader; DSV3 fused-AddTopk stays compute dtype.
+    sparseMoeParam.forceMoeFusedAddTopkAddNumFp32 = false;
     sparseMoeParam.enableExpertCumSumOutput = param.enableExpertCumSumOutput;
     sparseMoeParam.enableATBGateMatmul = param.enableATBGateMatmul;
     sparseMoeParam.enableFp32GateInput = fp32GateInput;
